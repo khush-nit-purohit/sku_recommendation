@@ -1,0 +1,12 @@
+# Dependencies for Azure SKU Recommendation CLI
+azure-identity
+azure-mgmt-monitor
+azure-mgmt-compute
+azure-mgmt-web
+azure-mgmt-sql>=4.0.0b1
+azure-mgmt-containerservice
+azure-mgmt-resource
+azure-mgmt-storage
+rich
+requests
+six
