@@ -568,6 +568,9 @@ def pick_sku(verdict: str, skus: list, metrics: dict, current_config: dict, metr
     def mem_gb(s):
         return getattr(s, "memory_gb", None) or (getattr(s, "memory_in_mb", 0) / 1024) or 0
 
+    # Ensure no resource of 1 vCPU is recommended. Only SKUs with minimum 2 vCPUs.
+    skus = [s for s in skus if cpu_cores(s) >= 2]
+
     current_cores = current_config.get("cpu_cores", 0)
     current_mem   = current_config.get("memory_gb", 0)
     # Treat unknown/string values as 0
