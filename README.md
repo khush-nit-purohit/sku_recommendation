@@ -41,6 +41,14 @@ python main.py /subscriptions/<SUB_ID>/resourceGroups/<RG>/providers/Microsoft.C
 
 Alternatively, append standard `--verbose` triggers for granular telemetry summaries.
 
+## Local SKU Cache
+
+The tool maintains a local SQLite database (`sku_cache.db`) in the project root to store Azure SKU specifications, compatibility data, and pricing information. This significantly improves performance for subsequent runs.
+
+- **Storage:** `sku_cache.db` (automatically ignored by git)
+- **Refresh:** The cache is automatically refreshed if it's older than 7 days. You can force a refresh using the `--refresh-db` flag.
+- **Dependency:** Requires the [Azure CLI](https://aka.ms/installazurecli) to be installed and logged in to populate the cache initially.
+
 ## Core Threshold Configuration
 
 Evaluations adhere to fixed guidelines:

@@ -4,10 +4,10 @@ from __future__ import annotations
 import warnings
 warnings.filterwarnings("ignore", category=SyntaxWarning, module=r"azure\.mgmt")
 warnings.filterwarnings("ignore", category=UserWarning, module=r"msal")
-import re, sys, argparse
+import re, sys, argparse, sqlite3
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse, unquote
-from typing import Any
+from typing import Any, Optional
 import requests
 from azure.identity import AzureCliCredential, InteractiveBrowserCredential, ChainedTokenCredential
 from azure.core.exceptions import ClientAuthenticationError
@@ -28,6 +28,22 @@ console = Console()
 UNDER_THRESHOLD  = 0.20
 OVER_THRESHOLD   = 0.80
 ARTIFICIAL_RATIO = 3.0
+
+# ── SKU Cache DB (module-level, initialised in main()) ────────────────────────
+_db_conn: Optional[sqlite3.Connection] = None
+_sub_id:  Optional[str]               = None
+
+
+def init_sku_db(db_path: str) -> sqlite3.Connection:
+    global _db_conn
+    from resource_advisor.db.schema import init_db
+    _db_conn = init_db(db_path)
+    # Wire the same connection into the resource_advisor library modules
+    from resource_advisor.providers.azure import pricing as _pricing_mod
+    from resource_advisor.providers.azure import skus as _skus_mod
+    _pricing_mod.set_db_conn(_db_conn)
+    _skus_mod.set_db_conn(_db_conn)
+    return _db_conn
 
 # ── Resource ID Parser ─────────────────────────────────────────────────────────
 def parse_resource_id(raw: str) -> dict:
@@ -100,17 +116,21 @@ class VMSizeInfo:
 
 def list_available_vm_sizes(compute_client, location: str) -> list[VMSizeInfo]:
     """
-    Return VM sizes that are actually deployable (no restrictions) in the given region.
-    Uses the same resource_skus API that 'az vm list-skus' uses — filters out
-    any size with active restrictions in the subscription.
+    Return VM sizes deployable in the region.
+    Checks the local SQLite cache first; falls back to the resource_skus API.
     """
+    if _db_conn is not None and _sub_id is not None:
+        from resource_advisor.db.queries import get_vm_skus
+        rows = get_vm_skus(_db_conn, _sub_id, location)
+        if rows:
+            return [VMSizeInfo(r["sku_name"], int(r["vcpus"]), int(r["memory_mb"])) for r in rows]
+
     results = []
     try:
         skus = compute_client.resource_skus.list(filter=f"location eq '{location}'")
         for s in skus:
             if s.resource_type != "virtualMachines":
                 continue
-            # Skip if any restriction applies (e.g. NotAvailableForSubscription)
             if s.restrictions:
                 continue
             caps = {c.name: c.value for c in (s.capabilities or [])}
@@ -236,11 +256,21 @@ def evaluate(metrics: dict, config: dict, metric_defs: list) -> tuple[str, str, 
 
         ratio = eff_avg / baseline if baseline else 0
 
-        if cap > ARTIFICIAL_RATIO * eff_max and eff_max > 0:
+        # Check utilization based on absolute capacity (cap)
+        is_over = eff_avg > OVER_THRESHOLD * cap
+        is_under = eff_avg < UNDER_THRESHOLD * cap
+
+        # A resource is properly provisioned if it's neither over nor under utilized
+        is_properly_provisioned = not is_over and not is_under
+
+        # Check if the dynamic baseline calculation would have erroneously flagged it
+        is_baseline_error = (eff_avg > OVER_THRESHOLD * baseline) or (eff_avg < UNDER_THRESHOLD * baseline)
+
+        if is_properly_provisioned and is_baseline_error:
             verdict = "ARTIFICIAL_BASELINE"
-        elif eff_avg > OVER_THRESHOLD * baseline:
+        elif is_over:
             verdict = "OVERUTILIZED"
-        elif eff_avg < UNDER_THRESHOLD * baseline:
+        elif is_under:
             verdict = "UNDERUTILIZED"
         else:
             verdict = "NO_RECOMMENDATION"
@@ -255,10 +285,16 @@ def evaluate(metrics: dict, config: dict, metric_defs: list) -> tuple[str, str, 
     return worst_verdict, worst_metric, worst_ratio, worst_baseline
 
 
-# ── Cost Fetching (Azure Retail Prices API) ────────────────────────────────────
+# ── Cost Fetching (Azure Retail Prices API, DB-cached) ────────────────────────
 def fetch_price(sku_name: str, location: str, service_name: str = "Virtual Machines") -> float | None:
+    # Check persistent DB cache first
+    if _db_conn is not None:
+        from resource_advisor.db.queries import get_price
+        cached = get_price(_db_conn, location, sku_name, service_name)
+        if cached is not None:
+            return cached
+
     try:
-        # Normalize SKU for pricing API: e.g. "Standard_D4as_v4" -> "D4as v4"
         normalized_sku = sku_name
         if normalized_sku.startswith("Standard_"):
             normalized_sku = normalized_sku[len("Standard_"):]
@@ -277,7 +313,11 @@ def fetch_price(sku_name: str, location: str, service_name: str = "Virtual Machi
         items = r.json().get("Items", [])
         for item in items:
             if "windows" not in item.get("productName", "").lower():
-                return item.get("retailPrice")
+                price = item.get("retailPrice")
+                if price is not None and _db_conn is not None:
+                    from resource_advisor.db.queries import upsert_price
+                    upsert_price(_db_conn, location, sku_name, service_name, price)
+                return price
     except Exception as e:
         console.print(f"[dim]Pricing lookup failed ({sku_name}): {e}[/dim]")
     return None
@@ -410,11 +450,12 @@ class AKSHandler:
         node_count = pool.count or 1 if pool else 1
 
         # Resolve VM size capacity via Compute (stored on handler for list_skus)
-        self._vm_size  = vm_size
-        self._location = cluster.location
+        self._vm_size    = vm_size
+        self._location   = cluster.location
         self._node_count = node_count
-        self._cred = client._config.credential
-        self._sub  = rid["subscription_id"]
+        self._cred       = client._config.credential
+        self._sub        = rid["subscription_id"]
+        self._k8s_version = getattr(cluster, "kubernetes_version", None) or "unknown"
 
         # Try to get VM size details for cores/memory
         cpu_cores = "N/A"
@@ -457,13 +498,33 @@ class AKSHandler:
         return c.location
 
     def list_skus(self, client, location: str):
-        """List VM sizes available in the region — these are the valid AKS node pool sizes."""
+        """List VM sizes valid for AKS node pools in this region.
+
+        Uses DB cache: intersects subscription-available VM SKUs with AKS-compatible
+        node SKUs so only sizes confirmed for this cluster's k8s version are returned.
+        Falls back to the generic VM size list when the cache is empty.
+        """
+        sub  = getattr(self, "_sub",  None)
+        cred = getattr(self, "_cred", None) or client._config.credential
+
+        if _db_conn is not None and sub:
+            from resource_advisor.db.queries import get_vm_skus, get_aks_skus
+            vm_rows   = get_vm_skus(_db_conn, sub, location)
+            aks_names = get_aks_skus(_db_conn, location)
+            if vm_rows and aks_names:
+                filtered = [r for r in vm_rows if r["sku_name"].lower() in aks_names]
+                if filtered:
+                    sizes = [VMSizeInfo(r["sku_name"], int(r["vcpus"]), int(r["memory_mb"])) for r in filtered]
+                    console.print(
+                        f"[dim]Found {len(sizes)} AKS-compatible VM sizes for {location} "
+                        f"(k8s {getattr(self, '_k8s_version', 'unknown')}, from cache).[/dim]"
+                    )
+                    return sizes
+
+        # Fall back to all available VM sizes in subscription
         try:
             from azure.mgmt.compute import ComputeManagementClient
-            # Reuse credential + sub stored during get_config
-            cred = getattr(self, "_cred", None) or client._config.credential
-            sub  = getattr(self, "_sub",  None) or client._config.subscription_id
-            compute = ComputeManagementClient(cred, sub)
+            compute = ComputeManagementClient(cred, sub or client._config.subscription_id)
             sizes = list_available_vm_sizes(compute, location)
             console.print(f"[dim]Found {len(sizes)} VM sizes available in {location}.[/dim]")
             return sizes
@@ -599,10 +660,10 @@ def pick_sku(verdict: str, skus: list, metrics: dict, current_config: dict, metr
     worst_avg_frac  = max(avg_fracs)
 
     if verdict == "UNDERUTILIZED":
-        # min_cores = minimum cores required to handle 1.3× peak load
+        # min_cores = minimum cores required to handle 1.5× peak load
         # We want: min_cores <= new_cores < current_cores (pick largest that fits)
-        min_cores = max(1.3 * worst_peak_frac * current_cores, 1) if current_cores else 1
-        min_mem   = max(1.3 * worst_peak_frac * current_mem,   0.5) if current_mem else 0.5
+        min_cores = max(1.5 * worst_peak_frac * current_cores, 1) if current_cores else 1
+        min_mem   = max(1.5 * worst_peak_frac * current_mem,   0.5) if current_mem else 0.5
 
         candidates = [s for s in skus
                       if (not current_cores or cpu_cores(s) >= min_cores)
@@ -616,9 +677,9 @@ def pick_sku(verdict: str, skus: list, metrics: dict, current_config: dict, metr
 
 
     elif verdict == "OVERUTILIZED":
-        # Target: smallest SKU ≥ 1.5× current average usage
-        need_cores = 1.5 * worst_avg_frac * current_cores if current_cores else 0
-        need_mem   = 1.5 * worst_avg_frac * current_mem   if current_mem   else 0
+        # Target: smallest SKU ≥ 1.5× current peak usage
+        need_cores = 1.5 * worst_peak_frac * current_cores if current_cores else 0
+        need_mem   = 1.5 * worst_peak_frac * current_mem   if current_mem   else 0
         candidates = [s for s in skus
                       if (not current_cores or cpu_cores(s) >= need_cores)
                       and (not current_mem   or mem_gb(s)   >= need_mem)]
@@ -629,16 +690,8 @@ def pick_sku(verdict: str, skus: list, metrics: dict, current_config: dict, metr
         return candidates[0] if candidates else None
 
     elif verdict == "ARTIFICIAL_BASELINE":
-        # Right-size to 1.2× actual peak (not configured capacity)
-        need_cores = max(1.2 * worst_peak_frac * current_cores, 1) if current_cores else 1
-        need_mem   = max(1.2 * worst_peak_frac * current_mem,   0.5) if current_mem else 0.5
-        candidates = [s for s in skus
-                      if cpu_cores(s) >= need_cores and mem_gb(s) >= need_mem]
-        # Must be smaller than current (it's an over-provisioned resource)
-        candidates = [s for s in candidates
-                      if cpu_cores(s) < current_cores or mem_gb(s) < current_mem]
-        candidates = sorted(candidates, key=lambda s: cpu_cores(s))
-        return candidates[0] if candidates else None
+        # Resource is properly provisioned against capacity, no SKU change recommended
+        return None
 
     return None
 
@@ -676,13 +729,16 @@ VERDICT_ICON = {
 def render_output(rid: dict, handler, config: dict, metrics: dict, metric_defs: list,
                   all_metric_defs: list,
                   verdict: str, worst_metric: str, recommended_sku, location: str,
-                  current_price: float | None, rec_price: float | None):
+                  current_price: float | None, rec_price: float | None,
+                  k8s_version: str | None = None):
     color = VERDICT_COLOR.get(verdict, "white")
     icon  = VERDICT_ICON.get(verdict, "")
 
     lines = []
     lines.append(f"[bold]Resource   :[/bold] {rid['resource_name']}  ([dim]{handler.label}[/dim])")
     lines.append(f"[bold]Region     :[/bold] {location}")
+    if k8s_version:
+        lines.append(f"[bold]K8s Version:[/bold] {k8s_version}")
     mem_gb = config.get('memory_gb', None)
     cpu_cores = config.get('cpu_cores', None)
     if cpu_cores is not None or isinstance(mem_gb, (int, float)):
@@ -776,9 +832,9 @@ def render_output(rid: dict, handler, config: dict, metrics: dict, metric_defs: 
             savings_pct = savings / current_price * 100
             monthly_savings = savings * 24 * 30
             if savings > 0:
-                lines.append(f"  [bold green]↓ Saves ${savings:.4f}/hr  (~${monthly_savings:.0f}/month · {savings_pct:.0f}% cheaper)[/bold green]")
+                lines.append(f"  [bold green]- Saves ${savings:.4f}/hr  (~${monthly_savings:.0f}/month · {savings_pct:.0f}% cheaper)[/bold green]")
             else:
-                lines.append(f"  [bold red]↑ Costs ${-savings:.4f}/hr more  (~${-monthly_savings:.0f}/month · {-savings_pct:.0f}% more expensive)[/bold red]")
+                lines.append(f"  [bold red]+ Costs ${-savings:.4f}/hr more  (~${-monthly_savings:.0f}/month · {-savings_pct:.0f}% more expensive)[/bold red]")
         elif current_price:
             lines.append(f"  [dim]Current: ${current_price:.4f}/hr — recommended pricing unavailable[/dim]")
         else:
@@ -789,8 +845,13 @@ def render_output(rid: dict, handler, config: dict, metrics: dict, metric_defs: 
         if current_price:
             monthly = current_price * 24 * 30
             lines.append(f"  [dim]Current cost: ${current_price:.4f}/hr  (~${monthly:.0f}/month)[/dim]")
+    elif verdict == "ARTIFICIAL_BASELINE":
+        lines.append(f"  [bold green]✓ No change needed[/bold green] — resource is properly provisioned but flagged by baseline.")
+        if current_price:
+            monthly = current_price * 24 * 30
+            lines.append(f"  [dim]Current cost: ${current_price:.4f}/hr  (~${monthly:.0f}/month)[/dim]")
     else:
-        if verdict in ("UNDERUTILIZED", "ARTIFICIAL_BASELINE"):
+        if verdict == "UNDERUTILIZED":
             lines.append("  [yellow]You are already on the smallest available SKU that fits the criteria in this region.[/yellow]")
         elif verdict == "OVERUTILIZED":
             lines.append("  [yellow]You are already on the largest available SKU in this region, or no larger SKU fits the criteria.[/yellow]")
@@ -807,9 +868,13 @@ def render_output(rid: dict, handler, config: dict, metrics: dict, metric_defs: 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 def main():
+    global _sub_id
+
     parser = argparse.ArgumentParser(description="Azure SKU Recommendation Tool")
     parser.add_argument("resource_url", nargs="?", help="Azure resource URL or resource ID")
     parser.add_argument("--verbose", "-v", action="store_true", help="Show raw metric timeseries")
+    parser.add_argument("--refresh-db", action="store_true",
+                        help="Force-refresh the local SKU cache regardless of age")
     args = parser.parse_args()
 
     if args.resource_url:
@@ -828,6 +893,14 @@ def main():
 
     cred = _get_credential()
     sub  = rid["subscription_id"]
+    _sub_id = sub
+
+    # Initialise local SKU cache DB (sku_cache.db in project root)
+    try:
+        db_conn = init_sku_db("sku_cache.db")
+        console.print("[dim]SKU cache DB ready (local).[/dim]")
+    except Exception as e:
+        console.print(f"[yellow]Warning: could not init SKU cache DB ({e}). Falling back to live APIs.[/yellow]")
 
     handler = get_handler(rid["full_type"])
 
@@ -861,6 +934,22 @@ def main():
         except Exception as e:
             console.print(f"[yellow]Warning: could not fetch location ({e})[/yellow]")
             location = "eastus"
+
+    # Refresh SKU cache if stale (>7 days) or forced via --refresh-db
+    if _db_conn is not None:
+        from resource_advisor.db.queries import is_stale as _is_stale
+        from resource_advisor.db.refresh import refresh_location as _refresh_location
+        needs_refresh = args.refresh_db or _is_stale(_db_conn, sub, location)
+        if needs_refresh:
+            reason = "forced" if args.refresh_db else "cache stale or empty"
+            with console.status(f"[bold green]Refreshing SKU cache for {location} ({reason})..."):
+                try:
+                    _refresh_location(_db_conn, sub, location)
+                    console.print(f"[dim]SKU cache refreshed for {location}.[/dim]")
+                except Exception as e:
+                    console.print(f"[yellow]Warning: SKU cache refresh failed ({e}). Using live APIs.[/yellow]")
+        else:
+            console.print(f"[dim]SKU cache for {location} is fresh.[/dim]")
 
     metric_defs = handler.get_metric_definitions()
     primary_names = [m for m, *_ in metric_defs]
@@ -913,9 +1002,10 @@ def main():
             if recommended_sku:
                 rec_price = fetch_price(recommended_sku.name, location, handler.price_service_name)
 
+    k8s_version = getattr(handler, "_k8s_version", None)
     render_output(rid, handler, config, metrics, metric_defs, all_metric_defs,
                   verdict, worst_metric, recommended_sku, location,
-                  current_price, rec_price)
+                  current_price, rec_price, k8s_version=k8s_version)
 
 
 if __name__ == "__main__":
